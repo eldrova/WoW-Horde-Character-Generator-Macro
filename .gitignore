@@ -1,0 +1,12 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated
+debug.png
+samples/*_annotated.png
