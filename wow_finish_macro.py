@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import ctypes
 import json
 import os
 import sys
@@ -236,23 +237,65 @@ def grab_content(win):
     return img, rect
 
 
+# Capture goes through ctypes with explicit CFRelease: via pyobjc the pixel buffer of every
+# CGWindowListCreateImage result leaked (~21 MB per Retina frame on macOS 27), and after a
+# few hours macOS killed the process ("Killed: 9").
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _CGRect(ctypes.Structure):
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
+
+_cg = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+_cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+_cg.CGWindowListCreateImage.argtypes = [_CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
+_cg.CGWindowListCreateImage.restype = ctypes.c_void_p
+for _fn in ("CGImageGetWidth", "CGImageGetHeight", "CGImageGetBytesPerRow"):
+    getattr(_cg, _fn).argtypes = [ctypes.c_void_p]
+    getattr(_cg, _fn).restype = ctypes.c_size_t
+_cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
+_cg.CGImageGetDataProvider.restype = ctypes.c_void_p
+_cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
+_cg.CGDataProviderCopyData.restype = ctypes.c_void_p
+_cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+_cf.CFDataGetBytePtr.restype = ctypes.POINTER(ctypes.c_uint8)
+_cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+_cf.CFDataGetLength.restype = ctypes.c_long
+_cf.CFRelease.argtypes = [ctypes.c_void_p]
+_cf.CFRelease.restype = None
+
+_LIST_ON_SCREEN_ONLY, _LIST_INCLUDING_WINDOW = 1, 8   # kCGWindowListOption*
+_IMAGE_DEFAULT, _IMAGE_IGNORE_FRAMING = 0, 1          # kCGWindowImage*
+
+
 def grab(rect, win=None):
     """RGB array of the rect. Only WoW's own window is captured when win is given."""
     x0, y0, x1, y1 = rect
-    cg_rect = Quartz.CGRectMake(x0, y0, x1 - x0, y1 - y0)
+    cg_rect = _CGRect(_CGPoint(x0, y0), _CGSize(x1 - x0, y1 - y0))
     if win is not None:
-        img = Quartz.CGWindowListCreateImage(cg_rect, Quartz.kCGWindowListOptionIncludingWindow,
-                                             win["kCGWindowNumber"], Quartz.kCGWindowImageBoundsIgnoreFraming)
+        img = _cg.CGWindowListCreateImage(cg_rect, _LIST_INCLUDING_WINDOW, win["kCGWindowNumber"], _IMAGE_IGNORE_FRAMING)
     else:
-        img = Quartz.CGWindowListCreateImage(cg_rect, Quartz.kCGWindowListOptionOnScreenOnly,
-                                             Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault)
-    if img is None:  # API unavailable or denied -> fall back to screencapture
+        img = _cg.CGWindowListCreateImage(cg_rect, _LIST_ON_SCREEN_ONLY, 0, _IMAGE_DEFAULT)
+    if not img:  # API unavailable or denied -> fall back to screencapture
         return np.asarray(ImageGrab.grab(bbox=rect).convert("RGB"))
-    w, h = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
-    stride = Quartz.CGImageGetBytesPerRow(img)
-    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
-    buf = np.frombuffer(bytes(data), dtype=np.uint8).reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
-    return np.ascontiguousarray(buf[:, :, 2::-1])  # BGRA -> RGB
+    try:
+        w, h = _cg.CGImageGetWidth(img), _cg.CGImageGetHeight(img)
+        stride = _cg.CGImageGetBytesPerRow(img)
+        data = _cg.CGDataProviderCopyData(_cg.CGImageGetDataProvider(img))
+        try:
+            buf = np.ctypeslib.as_array(_cf.CFDataGetBytePtr(data), shape=(_cf.CFDataGetLength(data),))
+            buf = buf[:h * stride].reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
+            return np.ascontiguousarray(buf[:, :, 2::-1])  # BGRA -> RGB, copied before release
+        finally:
+            _cf.CFRelease(data)
+    finally:
+        _cf.CFRelease(img)
 
 
 def click(x, y):
