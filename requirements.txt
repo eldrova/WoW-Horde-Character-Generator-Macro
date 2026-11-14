@@ -1,2 +1,4 @@
 pillow
 numpy
+pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices
