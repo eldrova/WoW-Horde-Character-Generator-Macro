@@ -37,8 +37,9 @@ from PIL import Image, ImageDraw, ImageGrab
 try:
     import Quartz
     import ApplicationServices as AS
+    import AppKit
 except ImportError:  # --test on image files works without pyobjc
-    Quartz = AS = None
+    Quartz = AS = AppKit = None
 
 # --------------------------------------------------------------------------- settings
 PAUSE_SECONDS = 10.0        # pause when neither button is visible
@@ -51,7 +52,8 @@ START_DELAY = 3.0           # time to Cmd+Tab into WoW after starting
 ONLY_WHEN_WOW_FOCUSED = True  # never click while another window is in front
 TITLE_BAR_PT = 28           # macOS title bar height, stripped when WoW is not fullscreen
 
-WOW_OWNER_NAME = "World of Warcraft"
+# The game process shows up as "Wow" on macOS (the .app is "World of Warcraft").
+WOW_OWNER_NAMES = ("Wow", "World of Warcraft")
 # macOS virtual key codes. F-keys act as media keys by default, so press them with fn.
 VK_F7, VK_F8, VK_F10 = 0x62, 0x64, 0x6D
 
@@ -162,7 +164,7 @@ def find_wow_window():
     """Largest normal-layer window owned by WoW, or None."""
     best = None
     for w in _windows():
-        if w.get("kCGWindowOwnerName") != WOW_OWNER_NAME or w.get("kCGWindowLayer", 0) != 0:
+        if w.get("kCGWindowOwnerName") not in WOW_OWNER_NAMES or w.get("kCGWindowLayer", 0) != 0:
             continue
         b = w["kCGWindowBounds"]
         if best is None or b["Width"] * b["Height"] > best["kCGWindowBounds"]["Width"] * best["kCGWindowBounds"]["Height"]:
@@ -206,6 +208,32 @@ def client_rect(win):
         y += TITLE_BAR_PT
         h -= TITLE_BAR_PT
     return int(x), int(y), int(x + w), int(y + h)
+
+
+def _notch_inset(rect):
+    """Top safe-area inset (camera housing) of the screen containing rect, in points."""
+    x0, y0 = rect[0], rect[1]
+    main_h = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()).size.height
+    for s in AppKit.NSScreen.screens():
+        f = s.frame()  # Cocoa coordinates: bottom-left origin
+        top = main_h - (f.origin.y + f.size.height)
+        if f.origin.x <= x0 < f.origin.x + f.size.width and abs(y0 - top) < 1:
+            return float(s.safeAreaInsets().top) if hasattr(s, "safeAreaInsets") else 0.0
+    return 0.0
+
+
+def grab_content(win):
+    """(RGB array, rect) of the area WoW actually renders. On a notched MacBook a fullscreen
+    WoW leaves a black band under the camera housing; it is cut off so the centre anchor
+    and height scaling match the game's real viewport."""
+    rect = client_rect(win)
+    img = grab(rect, win)
+    inset = _notch_inset(rect)
+    if inset > 0:
+        k = int(round(inset * img.shape[1] / float(rect[2] - rect[0])))
+        if 0 < k < img.shape[0] and img[:k].max() <= 8:
+            return img[k:], (rect[0], rect[1] + int(round(inset)), rect[2], rect[3])
+    return img, rect
 
 
 def grab(rect, win=None):
@@ -422,8 +450,7 @@ def run():
             continue
         focus_warned = False
 
-        rect = client_rect(win)
-        img = grab(rect, win)
+        img, rect = grab_content(win)
         h, w = img.shape[:2]
         scale = w / float(rect[2] - rect[0])  # capture pixels per point (2.0 on Retina)
         s = analyze(img)
@@ -490,12 +517,13 @@ def debug():
     if win is None:
         r = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
         rect = (0, 0, int(r.size.width), int(r.size.height))
+        img = grab(rect)
     else:
-        rect = client_rect(win)
+        img, rect = grab_content(win)
         log(f"Window bounds {dict(win['kCGWindowBounds'])}, displays {_display_rects()}, "
-            f"fullscreen={is_fullscreen(win)} (title bar stripped: {not is_fullscreen(win)})")
+            f"fullscreen={is_fullscreen(win)} (title bar stripped: {not is_fullscreen(win)}), "
+            f"notch inset {_notch_inset(client_rect(win))} pt")
     log(f"WoW window: {'found' if win else 'NOT found (using main display)'}; content rect {rect} (points)")
-    img = grab(rect, win)
     s = analyze(img)
     print(fmt(s))
     if img.max() < 10:
