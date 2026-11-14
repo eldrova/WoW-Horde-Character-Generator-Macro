@@ -1,5 +1,9 @@
 # WoW Horde Character Generator Macro
 
+> ## 🍎 macOS version → [**mac-port branch**](https://github.com/eldrova/WoW-Horde-Character-Generator-Macro/tree/mac-port)
+> Using a Mac? Get the macOS port here: [**Download ZIP (macOS)**](https://github.com/eldrova/WoW-Horde-Character-Generator-Macro/archive/refs/heads/mac-port.zip).
+> It runs with a double-click on `WoW Macro.command`. This page (`main`) is the **Windows** version.
+
 Keeps clicking **Finish** on the WoW character-creation screen. When the
 "population imbalance" popup appears it clicks **Okay**, then goes back to Finish.
 If neither button is visible for longer than `GRACE_SECONDS` (1.5 s), it pauses
