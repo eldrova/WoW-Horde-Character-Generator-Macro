@@ -10,6 +10,3 @@ __pycache__/
 # Generated
 debug.png
 samples/*_annotated.png
-
-# Local virtualenv (created by "WoW Macro.command")
-.venv/

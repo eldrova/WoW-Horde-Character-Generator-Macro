@@ -1,5 +1,5 @@
 """
-WoW character-creation "Finish" spam macro (macOS port).
+WoW character-creation "Finish" spam macro (Windows only).
 
 Loop:
   * If the population-imbalance popup ("Okay" button) is visible -> click Okay.
@@ -10,10 +10,7 @@ Detection is pixel-colour based. Positions are expressed in a 2000x1125 referenc
 frame and scaled by the game's client-area height, so any 16:9 / 21:9 resolution
 works as long as the in-game UI scale matches the reference screenshots.
 
-Hotkeys (global, polled):  fn+F7 = Telegram test,  fn+F8 = pause / resume,  fn+F10 = quit.
-
-macOS needs Screen Recording and Accessibility permission for the app that runs
-this script (Terminal when started from "WoW Macro.command").
+Hotkeys (global, polled):  F8 = pause / resume,  F10 = quit.
 
 Usage:
   python wow_finish_macro.py            # run the macro
@@ -22,6 +19,8 @@ Usage:
 """
 
 import argparse
+import ctypes
+import ctypes.wintypes as wt
 import json
 import os
 import sys
@@ -31,15 +30,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# DPI awareness MUST be set before any capture / window-geometry call, otherwise
+# capture coordinates and click coordinates live in different spaces at >100% scaling.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor DPI aware
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab
-
-try:
-    import Quartz
-    import ApplicationServices as AS
-    import AppKit
-except ImportError:  # --test on image files works without pyobjc
-    Quartz = AS = AppKit = None
 
 # --------------------------------------------------------------------------- settings
 PAUSE_SECONDS = 10.0        # pause when neither button is visible
@@ -48,14 +50,10 @@ GRACE_SECONDS = 1.5         # "neither visible" must last this long before pausi
 AFTER_FINISH_CLICK = 0.5    # wait after clicking Finish
 AFTER_OKAY_CLICK = 0.4      # wait after clicking Okay
 POLL_INTERVAL = 0.15        # idle loop interval
-START_DELAY = 3.0           # time to Cmd+Tab into WoW after starting
+START_DELAY = 3.0           # time to alt-tab into WoW after starting
 ONLY_WHEN_WOW_FOCUSED = True  # never click while another window is in front
-TITLE_BAR_PT = 28           # macOS title bar height, stripped when WoW is not fullscreen
 
-# The game process shows up as "Wow" on macOS (the .app is "World of Warcraft").
-WOW_OWNER_NAMES = ("Wow", "World of Warcraft")
-# macOS virtual key codes. F-keys act as media keys by default, so press them with fn.
-VK_F7, VK_F8, VK_F10 = 0x62, 0x64, 0x6D
+VK_F7, VK_F8, VK_F10 = 0x76, 0x77, 0x79
 
 # .env next to this script: line 1 = Telegram bot token, line 2 = chat id
 # (plain values or KEY=value lines both work).
@@ -148,138 +146,40 @@ def analyze(img):
     return s
 
 
-# --------------------------------------------------------------------------- macOS
-# All window bounds and click coordinates are in points (global, top-left origin).
-# Captures may come back in Retina pixels, so clicks are divided by the capture scale.
-
-
-def _windows():
-    """On-screen windows, front to back."""
-    return Quartz.CGWindowListCopyWindowInfo(
-        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements,
-        Quartz.kCGNullWindowID) or []
+# --------------------------------------------------------------------------- win32
+user32 = ctypes.windll.user32
+MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
 
 
 def find_wow_window():
-    """Largest normal-layer window owned by WoW, or None."""
-    best = None
-    for w in _windows():
-        if w.get("kCGWindowOwnerName") not in WOW_OWNER_NAMES or w.get("kCGWindowLayer", 0) != 0:
-            continue
-        b = w["kCGWindowBounds"]
-        if best is None or b["Width"] * b["Height"] > best["kCGWindowBounds"]["Width"] * best["kCGWindowBounds"]["Height"]:
-            best = w
-    return best
+    hwnd = user32.FindWindowW("GxWindowClass", None)  # WoW's window class
+    if not hwnd:
+        hwnd = user32.FindWindowW(None, "World of Warcraft")
+    return hwnd or None
 
 
-def wow_is_frontmost(win):
-    """True if WoW owns the frontmost normal window (no run loop needed, unlike NSWorkspace)."""
-    for w in _windows():
-        b = w["kCGWindowBounds"]
-        # skip invisible / tiny helper windows other apps keep on screen
-        if w.get("kCGWindowLayer", 0) == 0 and w.get("kCGWindowAlpha", 1) > 0 and b["Width"] > 50 and b["Height"] > 50:
-            return w.get("kCGWindowOwnerPID") == win.get("kCGWindowOwnerPID")
-    return False
+def client_rect(hwnd):
+    """Screen rect (left, top, right, bottom) of the game's client area, or the primary screen."""
+    if hwnd:
+        rc = wt.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rc))
+        pt = wt.POINT(0, 0)
+        user32.ClientToScreen(hwnd, ctypes.byref(pt))
+        if rc.right > 0 and rc.bottom > 0:
+            return pt.x, pt.y, pt.x + rc.right, pt.y + rc.bottom
+    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 
-def _display_rects():
-    err, ids, n = Quartz.CGGetActiveDisplayList(16, None, None)
-    rects = []
-    for d in (ids or [])[:n]:
-        r = Quartz.CGDisplayBounds(d)
-        rects.append((r.origin.x, r.origin.y, r.size.width, r.size.height))
-    return rects
-
-
-def is_fullscreen(win):
-    """Full display width and touching the display bottom. A fullscreen game on a notched
-    MacBook can start below the camera housing / menu bar, so the top edge is not compared."""
-    b = win["kCGWindowBounds"]
-    x, y, w, h = b["X"], b["Y"], b["Width"], b["Height"]
-    return any(abs(x - dx) < 1 and abs(w - dw) < 1 and abs(y + h - (dy + dh)) < 1 and y - dy < 60
-               for dx, dy, dw, dh in _display_rects())
-
-
-def client_rect(win):
-    """Screen rect (left, top, right, bottom) in points of WoW's content area."""
-    b = win["kCGWindowBounds"]
-    x, y, w, h = b["X"], b["Y"], b["Width"], b["Height"]
-    if not is_fullscreen(win):
-        y += TITLE_BAR_PT
-        h -= TITLE_BAR_PT
-    return int(x), int(y), int(x + w), int(y + h)
-
-
-def _notch_inset(rect):
-    """Top safe-area inset (camera housing) of the screen containing rect, in points."""
-    x0, y0 = rect[0], rect[1]
-    main_h = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID()).size.height
-    for s in AppKit.NSScreen.screens():
-        f = s.frame()  # Cocoa coordinates: bottom-left origin
-        top = main_h - (f.origin.y + f.size.height)
-        if f.origin.x <= x0 < f.origin.x + f.size.width and abs(y0 - top) < 1:
-            return float(s.safeAreaInsets().top) if hasattr(s, "safeAreaInsets") else 0.0
-    return 0.0
-
-
-def grab_content(win):
-    """(RGB array, rect) of the area WoW actually renders. On a notched MacBook a fullscreen
-    WoW leaves a black band under the camera housing; it is cut off so the centre anchor
-    and height scaling match the game's real viewport."""
-    rect = client_rect(win)
-    img = grab(rect, win)
-    inset = _notch_inset(rect)
-    if inset > 0:
-        k = int(round(inset * img.shape[1] / float(rect[2] - rect[0])))
-        if 0 < k < img.shape[0] and img[:k].max() <= 8:
-            return img[k:], (rect[0], rect[1] + int(round(inset)), rect[2], rect[3])
-    return img, rect
-
-
-def grab(rect, win=None):
-    """RGB array of the rect. Only WoW's own window is captured when win is given."""
-    x0, y0, x1, y1 = rect
-    cg_rect = Quartz.CGRectMake(x0, y0, x1 - x0, y1 - y0)
-    if win is not None:
-        img = Quartz.CGWindowListCreateImage(cg_rect, Quartz.kCGWindowListOptionIncludingWindow,
-                                             win["kCGWindowNumber"], Quartz.kCGWindowImageBoundsIgnoreFraming)
-    else:
-        img = Quartz.CGWindowListCreateImage(cg_rect, Quartz.kCGWindowListOptionOnScreenOnly,
-                                             Quartz.kCGNullWindowID, Quartz.kCGWindowImageDefault)
-    if img is None:  # API unavailable or denied -> fall back to screencapture
-        return np.asarray(ImageGrab.grab(bbox=rect).convert("RGB"))
-    w, h = Quartz.CGImageGetWidth(img), Quartz.CGImageGetHeight(img)
-    stride = Quartz.CGImageGetBytesPerRow(img)
-    data = Quartz.CGDataProviderCopyData(Quartz.CGImageGetDataProvider(img))
-    buf = np.frombuffer(bytes(data), dtype=np.uint8).reshape(h, stride)[:, :w * 4].reshape(h, w, 4)
-    return np.ascontiguousarray(buf[:, :, 2::-1])  # BGRA -> RGB
+def grab(rect):
+    return np.asarray(ImageGrab.grab(bbox=rect, all_screens=True).convert("RGB"))
 
 
 def click(x, y):
-    def post(kind):
-        ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
-        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
-
-    post(Quartz.kCGEventMouseMoved)
+    user32.SetCursorPos(int(x), int(y))
     time.sleep(0.04)
-    post(Quartz.kCGEventLeftMouseDown)
+    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.04)
-    post(Quartz.kCGEventLeftMouseUp)
-
-
-def check_permissions(need_clicks=True):
-    """Ask for Screen Recording / Accessibility. Returns False (with instructions) if missing."""
-    ok = True
-    if not Quartz.CGPreflightScreenCaptureAccess():
-        Quartz.CGRequestScreenCaptureAccess()
-        log("Missing Screen Recording permission. System Settings > Privacy & Security > "
-            "Screen & System Audio Recording: enable Terminal, then quit and reopen Terminal.")
-        ok = False
-    if need_clicks and not AS.AXIsProcessTrustedWithOptions({AS.kAXTrustedCheckOptionPrompt: True}):
-        log("Missing Accessibility permission. System Settings > Privacy & Security > "
-            "Accessibility: enable Terminal, then quit and reopen Terminal.")
-        ok = False
-    return ok
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
 
 class Hotkeys:
@@ -287,7 +187,7 @@ class Hotkeys:
         self._down = {VK_F7: False, VK_F8: False, VK_F10: False}
 
     def pressed(self, vk):
-        down = bool(Quartz.CGEventSourceKeyState(Quartz.kCGEventSourceStateHIDSystemState, vk))
+        down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
         edge = down and not self._down[vk]
         self._down[vk] = down
         return edge
@@ -426,7 +326,7 @@ def run():
         return True
 
     log("Telegram: " + ("enabled (.env loaded)" if tg.enabled else "DISABLED (.env missing or incomplete)"))
-    log(f"Starting in {START_DELAY:.0f}s - switch to WoW (Cmd+Tab). fn+F7 = Telegram test, fn+F8 = pause/resume, fn+F10 = quit.")
+    log(f"Starting in {START_DELAY:.0f}s - switch to WoW. F7 = Telegram test, F8 = pause/resume, F10 = quit.")
     if not wait(START_DELAY):
         return
 
@@ -437,12 +337,10 @@ def run():
     paused_once = False  # True after a full PAUSE_SECONDS wait with neither button visible
 
     while not state["quit"]:
-        win = find_wow_window()
-        # Unlike Windows there is no whole-screen fallback: never click without the WoW window.
-        if win is None or (ONLY_WHEN_WOW_FOCUSED and not wow_is_frontmost(win)):
+        hwnd = find_wow_window()
+        if ONLY_WHEN_WOW_FOCUSED and hwnd and user32.GetForegroundWindow() != hwnd:
             if not focus_warned:
-                log("WoW window not found - waiting (no clicks)." if win is None
-                    else "WoW is not the active window - waiting (no clicks).")
+                log("WoW is not the active window - waiting (no clicks).")
                 focus_warned = True
             last_seen = time.time()
             if not wait(0.5):
@@ -450,10 +348,9 @@ def run():
             continue
         focus_warned = False
 
-        img, rect = grab_content(win)
-        h, w = img.shape[:2]
-        scale = w / float(rect[2] - rect[0])  # capture pixels per point (2.0 on Retina)
-        s = analyze(img)
+        rect = client_rect(hwnd)
+        w, h = rect[2] - rect[0], rect[3] - rect[1]
+        s = analyze(grab(rect))
         if s["okay"] or s["finish"]:
             paused_once = False
 
@@ -463,14 +360,14 @@ def run():
             break
         elif s["okay"]:
             x, y = click_point("okay", w, h)
-            click(rect[0] + x / scale, rect[1] + y / scale)
+            click(rect[0] + x, rect[1] + y)
             okay_clicks += 1
             log(f"Okay clicked   (#{okay_clicks})")
             last_seen = time.time()
             wait(AFTER_OKAY_CLICK)
         elif s["finish"]:
             x, y = click_point("finish", w, h)
-            click(rect[0] + x / scale, rect[1] + y / scale)
+            click(rect[0] + x, rect[1] + y)
             finish_clicks += 1
             if finish_clicks % 10 == 1:
                 log(f"Finish clicked (#{finish_clicks})")
@@ -513,21 +410,14 @@ def fmt(s):
 
 
 def debug():
-    win = find_wow_window()
-    if win is None:
-        r = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-        rect = (0, 0, int(r.size.width), int(r.size.height))
-        img = grab(rect)
-    else:
-        img, rect = grab_content(win)
-        log(f"Window bounds {dict(win['kCGWindowBounds'])}, displays {_display_rects()}, "
-            f"fullscreen={is_fullscreen(win)} (title bar stripped: {not is_fullscreen(win)}), "
-            f"notch inset {_notch_inset(client_rect(win))} pt")
-    log(f"WoW window: {'found' if win else 'NOT found (using main display)'}; content rect {rect} (points)")
+    hwnd = find_wow_window()
+    rect = client_rect(hwnd)
+    log(f"WoW window: {'found' if hwnd else 'NOT found (using primary screen)'}; client rect {rect}")
+    img = grab(rect)
     s = analyze(img)
     print(fmt(s))
     if img.max() < 10:
-        print("WARNING: captured image is black - check Screen Recording permission for Terminal.")
+        print("WARNING: captured image is black - switch WoW to Windowed (Fullscreen) mode.")
     annotate(img, s, "debug.png")
     log("Annotated screenshot saved to debug.png")
 
@@ -543,16 +433,11 @@ if __name__ == "__main__":
     ap.add_argument("--debug", action="store_true", help="annotate one live screenshot to debug.png and exit")
     ap.add_argument("--test", nargs="+", metavar="IMAGE", help="run detection on image files and exit")
     a = ap.parse_args()
+    if sys.platform != "win32":
+        sys.exit("Windows only.")
     if a.test:
         test(a.test)
-        sys.exit(0)
-    if sys.platform != "darwin":
-        sys.exit("This port is macOS only.")
-    if Quartz is None:
-        sys.exit("pyobjc missing - run: python3 -m pip install -r requirements.txt")
-    if not check_permissions(need_clicks=not a.debug):
-        sys.exit(1)
-    if a.debug:
+    elif a.debug:
         debug()
     else:
         try:
