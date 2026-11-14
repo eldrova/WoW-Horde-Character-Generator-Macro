@@ -173,7 +173,9 @@ def find_wow_window():
 def wow_is_frontmost(win):
     """True if WoW owns the frontmost normal window (no run loop needed, unlike NSWorkspace)."""
     for w in _windows():
-        if w.get("kCGWindowLayer", 0) == 0:
+        b = w["kCGWindowBounds"]
+        # skip invisible / tiny helper windows other apps keep on screen
+        if w.get("kCGWindowLayer", 0) == 0 and w.get("kCGWindowAlpha", 1) > 0 and b["Width"] > 50 and b["Height"] > 50:
             return w.get("kCGWindowOwnerPID") == win.get("kCGWindowOwnerPID")
     return False
 
@@ -187,13 +189,20 @@ def _display_rects():
     return rects
 
 
+def is_fullscreen(win):
+    """Full display width and touching the display bottom. A fullscreen game on a notched
+    MacBook can start below the camera housing / menu bar, so the top edge is not compared."""
+    b = win["kCGWindowBounds"]
+    x, y, w, h = b["X"], b["Y"], b["Width"], b["Height"]
+    return any(abs(x - dx) < 1 and abs(w - dw) < 1 and abs(y + h - (dy + dh)) < 1 and y - dy < 60
+               for dx, dy, dw, dh in _display_rects())
+
+
 def client_rect(win):
     """Screen rect (left, top, right, bottom) in points of WoW's content area."""
     b = win["kCGWindowBounds"]
     x, y, w, h = b["X"], b["Y"], b["Width"], b["Height"]
-    fullscreen = any(abs(x - dx) < 1 and abs(y - dy) < 1 and abs(w - dw) < 1 and abs(h - dh) < 1
-                     for dx, dy, dw, dh in _display_rects())
-    if not fullscreen:
+    if not is_fullscreen(win):
         y += TITLE_BAR_PT
         h -= TITLE_BAR_PT
     return int(x), int(y), int(x + w), int(y + h)
@@ -389,7 +398,7 @@ def run():
         return True
 
     log("Telegram: " + ("enabled (.env loaded)" if tg.enabled else "DISABLED (.env missing or incomplete)"))
-    log(f"Starting in {START_DELAY:.0f}s - switch to WoW. F7 = Telegram test, F8 = pause/resume, F10 = quit.")
+    log(f"Starting in {START_DELAY:.0f}s - switch to WoW (Cmd+Tab). fn+F7 = Telegram test, fn+F8 = pause/resume, fn+F10 = quit.")
     if not wait(START_DELAY):
         return
 
@@ -483,6 +492,8 @@ def debug():
         rect = (0, 0, int(r.size.width), int(r.size.height))
     else:
         rect = client_rect(win)
+        log(f"Window bounds {dict(win['kCGWindowBounds'])}, displays {_display_rects()}, "
+            f"fullscreen={is_fullscreen(win)} (title bar stripped: {not is_fullscreen(win)})")
     log(f"WoW window: {'found' if win else 'NOT found (using main display)'}; content rect {rect} (points)")
     img = grab(rect, win)
     s = analyze(img)
